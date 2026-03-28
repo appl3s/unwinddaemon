@@ -25,11 +25,13 @@ jobs:
           - platform_api: 'android-30'
             output_name: 'libstackplz.so'
             artifact_name: 'libstackplz-api30'
+            static_artifact_name: 'libstackplz-all-api30'
 
           # 第二个构建任务：针对 Android 10 (API 29)
           - platform_api: 'android-29'
             output_name: 'libstackplz10.so'
             artifact_name: 'libstackplz-api29'
+            static_artifact_name: 'libstackplz-all-api29'
             
     steps:
       # 步骤 1: 检出代码和所有子模块
@@ -68,17 +70,29 @@ jobs:
         working-directory: build
         run: make -j$(nproc)
 
-      # 步骤 6: 重命名产物 (如果需要)
+      # 步骤 6: 额外构建合并静态归档
+      - name: Build static all archive
+        working-directory: build
+        run: make stackplz_all -j$(nproc)
+
+      # 步骤 7: 重命名产物 (如果需要)
       # CMake 默认生成 libstackplz.so。对于 API 29 的构建，我们需要将其重命名为 libstackplz10.so
       - name: Rename Output Library (if necessary)
         # 仅当矩阵中定义的 output_name 不是默认名时才执行此步骤
         if: matrix.output_name != 'libstackplz.so'
-        run: mv build/libstackplz.so build/${{ matrix.output_name }}
+        run: mv build/lib/libstackplz.so build/lib/${{ matrix.output_name }}
         
-      # 步骤 7: 上传构建产物
+      # 步骤 8: 上传共享库产物（保留原有逻辑）
       # 使用 ${{ matrix.artifact_name }} 和 ${{ matrix.output_name }} 从矩阵中获取动态名称和路径
       - name: Upload Artifact (${{ matrix.artifact_name }})
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: build/${{ matrix.output_name }}
+          path: build/lib/${{ matrix.output_name }}
+
+      # 步骤 9: 上传合并静态归档产物
+      - name: Upload Artifact (${{ matrix.static_artifact_name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.static_artifact_name }}
+          path: build/lib/libstackplz_all.a
