@@ -3,8 +3,14 @@ project("stackplz")
 
 enable_language(C CXX ASM)
 
+option(STACKPLZ_BUILD_ALL "Build merged static archive libstackplz_all.a" ON)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_C_STANDARD 11)
+
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 set(C_FLAGS "-Wall -Wextra -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -flto=thin -ffunction-sections -fdata-sections")
 set(LINKER_FLAGS "-fuse-ld=lld -flto=thin -ffixed-x18 -Wl,--hash-style=both -Wl,--unresolved-symbols=ignore-all -Wl,--gc-sections")
@@ -191,6 +197,52 @@ target_include_directories(unwindstack
 )
 target_compile_options(unwindstack PRIVATE -Wno-c99-designator)
 target_compile_definitions(unwindstack PRIVATE DEXFILE_SUPPORT=1)
+
+add_library(stackplz_static STATIC lib.cpp)
+set_target_properties(stackplz_static PROPERTIES OUTPUT_NAME stackplz)
+target_include_directories(stackplz_static PUBLIC ${EXTERNAL_SRC}/libbase/include)
+target_include_directories(stackplz_static PUBLIC ${EXTERNAL_SRC}/bionic/libc/kernel/uapi)
+target_include_directories(stackplz_static PUBLIC ${EXTERNAL_SRC}/unwinding/libunwindstack/include)
+target_compile_definitions(stackplz_static PRIVATE DEXFILE_SUPPORT=1)
+target_link_libraries(stackplz_static base procinfo lzma dexfile_support unwindstack log)
+
+if (STACKPLZ_BUILD_ALL)
+    set(STACKPLZ_ALL_ARCHIVE "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libstackplz_all.a")
+    set(STACKPLZ_ALL_MRI "${CMAKE_CURRENT_BINARY_DIR}/stackplz_all.mri")
+    set(STACKPLZ_ALL_AR_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/stackplz_all_ar.cmake")
+
+    string(CONCAT STACKPLZ_ALL_MRI_CONTENT
+            "CREATE ${STACKPLZ_ALL_ARCHIVE}\n"
+            "ADDLIB $<TARGET_FILE:stackplz_static>\n"
+            "ADDLIB $<TARGET_FILE:base>\n"
+            "ADDLIB $<TARGET_FILE:procinfo>\n"
+            "ADDLIB $<TARGET_FILE:lzma>\n"
+            "ADDLIB $<TARGET_FILE:dexfile_support>\n"
+            "ADDLIB $<TARGET_FILE:unwindstack>\n"
+            "SAVE\n"
+            "END\n")
+    file(GENERATE OUTPUT "${STACKPLZ_ALL_MRI}" CONTENT "${STACKPLZ_ALL_MRI_CONTENT}")
+
+    string(CONCAT STACKPLZ_ALL_AR_SCRIPT_CONTENT
+            "execute_process(\n"
+            "  COMMAND \"${CMAKE_AR}\" -M\n"
+            "  INPUT_FILE \"${STACKPLZ_ALL_MRI}\"\n"
+            "  RESULT_VARIABLE stackplz_all_ret\n"
+            ")\n"
+            "if(NOT stackplz_all_ret EQUAL 0)\n"
+            "  message(FATAL_ERROR \"failed to generate ${STACKPLZ_ALL_ARCHIVE}, ar return=${stackplz_all_ret}\")\n"
+            "endif()\n")
+    file(GENERATE OUTPUT "${STACKPLZ_ALL_AR_SCRIPT}" CONTENT "${STACKPLZ_ALL_AR_SCRIPT_CONTENT}")
+
+    add_custom_command(
+            OUTPUT "${STACKPLZ_ALL_ARCHIVE}"
+            DEPENDS stackplz_static base procinfo lzma dexfile_support unwindstack
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}"
+            COMMAND "${CMAKE_COMMAND}" -P "${STACKPLZ_ALL_AR_SCRIPT}"
+            VERBATIM
+    )
+    add_custom_target(stackplz_all DEPENDS "${STACKPLZ_ALL_ARCHIVE}")
+endif ()
 
 # check are we top-level project
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
