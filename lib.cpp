@@ -574,10 +574,10 @@ const char* UnwindCallChainV3(int pid, UnwindOption* opt, uint64_t* regs_buf, vo
         return empty_result;
     }
 
-    // Fix PAC mask: strip top byte from return addresses during unwind
+    // Fix PAC mask: 39-bit VA on Android — PAC occupies bits [54:39]
     if (unwind_regs->Arch() == unwindstack::ARCH_ARM64) {
         static_cast<unwindstack::RegsArm64*>(unwind_regs.get())
-            ->SetPACMask(0xFF00000000000000ULL);
+            ->SetPACMask(0xFFFFFF8000000000ULL);
     }
 
     // Live process memory for code/ELF/.eh_frame/JIT descriptor reads
