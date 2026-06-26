@@ -1,6 +1,8 @@
 
 #include <inttypes.h>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -548,11 +550,44 @@ class CombinedMemory : public unwindstack::Memory {
   uint64_t stack_end_;
 };
 
-/*
- * V3: Hybrid unwind — offline stack (from BPF capture) + live process memory (for
- * code/ELF/JIT). Fixes both the timing race (V2 reads stale stack) and the coverage
- * gap (V1 can't read outside the buffer). Also fixes PAC mask.
- */
+struct PidCache {
+    std::shared_ptr<unwindstack::Memory> process_memory;
+    std::unique_ptr<unwindstack::RemoteMaps> maps;
+    std::unique_ptr<unwindstack::JitDebug> jit_debug;
+    std::unique_ptr<unwindstack::DexFiles> dex_files;
+    uint64_t call_count = 0;
+};
+
+static std::mutex g_cache_mutex;
+static std::unordered_map<pid_t, std::unique_ptr<PidCache>> g_pid_cache;
+
+static constexpr uint64_t kMapsRefreshInterval = 200;
+
+static PidCache* GetOrCreateCache(pid_t pid, unwindstack::ArchEnum arch) {
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    auto it = g_pid_cache.find(pid);
+    if (it != g_pid_cache.end()) {
+        PidCache* c = it->second.get();
+        c->call_count++;
+        if (c->call_count % kMapsRefreshInterval == 0) {
+            c->maps.reset(new unwindstack::RemoteMaps(pid));
+            c->maps->Parse();
+        }
+        return c;
+    }
+    auto cache = std::make_unique<PidCache>();
+    cache->process_memory = unwindstack::Memory::CreateProcessMemoryCached(pid);
+    cache->maps.reset(new unwindstack::RemoteMaps(pid));
+    cache->maps->Parse();
+    std::vector<std::string> search_libs;
+    cache->jit_debug = unwindstack::CreateJitDebug(arch, cache->process_memory, search_libs);
+    cache->dex_files = unwindstack::CreateDexFiles(arch, cache->process_memory, search_libs);
+    cache->call_count = 1;
+    PidCache* ptr = cache.get();
+    g_pid_cache[pid] = std::move(cache);
+    return ptr;
+}
+
 const char* UnwindCallChainV3(int pid, UnwindOption* opt, uint64_t* regs_buf, void* stack_buf) {
     RegSet regs(opt->abi, opt->reg_mask, regs_buf);
 
@@ -574,46 +609,27 @@ const char* UnwindCallChainV3(int pid, UnwindOption* opt, uint64_t* regs_buf, vo
         return empty_result;
     }
 
-    // Fix PAC mask: 39-bit VA on Android — PAC occupies bits [54:39]
     if (unwind_regs->Arch() == unwindstack::ARCH_ARM64) {
         static_cast<unwindstack::RegsArm64*>(unwind_regs.get())
             ->SetPACMask(0xFFFFFF8000000000ULL);
     }
 
-    // Live process memory for code/ELF/.eh_frame/JIT descriptor reads
-    auto process_memory = unwindstack::Memory::CreateProcessMemoryCached(pid);
+    PidCache* cache = GetOrCreateCache(pid, unwind_regs->Arch());
 
-    // Build combined memory: offline stack + live process
     std::shared_ptr<unwindstack::Memory> combined_memory;
     if (stack_buf != nullptr && stack_size > 0) {
         auto stack_memory = unwindstack::Memory::CreateOfflineMemory(
             reinterpret_cast<const uint8_t*>(stack_buf),
             stack_addr, stack_addr + stack_size);
         combined_memory = std::make_shared<CombinedMemory>(
-            stack_memory, process_memory, stack_addr, stack_addr + stack_size);
+            stack_memory, cache->process_memory, stack_addr, stack_addr + stack_size);
     } else {
-        // No buffer: fall back to full live read (V2 behavior)
-        combined_memory = process_memory;
+        combined_memory = cache->process_memory;
     }
 
-    // RemoteMaps: live /proc/pid/maps (correct, code mappings don't change during call)
-    std::unique_ptr<unwindstack::RemoteMaps> maps(new unwindstack::RemoteMaps(pid));
-    if (!maps->Parse()) {
-        std::cerr << "V3: maps parse failed for pid " << pid << std::endl;
-        char* empty_result = (char*)malloc(1);
-        if (empty_result) empty_result[0] = '\0';
-        return empty_result;
-    }
-
-    // Create unwinder with combined memory
-    UnwinderWithPC unwinder(512, maps.get(), unwind_regs.get(), combined_memory, opt->show_pc);
-
-    // Set up JitDebug + DexFiles with live process memory (reads __jit_debug_descriptor)
-    std::vector<std::string> search_libs;
-    auto jit_debug = unwindstack::CreateJitDebug(unwind_regs->Arch(), process_memory, search_libs);
-    auto dex_files = unwindstack::CreateDexFiles(unwind_regs->Arch(), process_memory, search_libs);
-    unwinder.SetJitDebug(jit_debug.get());
-    unwinder.SetDexFiles(dex_files.get());
+    UnwinderWithPC unwinder(512, cache->maps.get(), unwind_regs.get(), combined_memory, opt->show_pc);
+    unwinder.SetJitDebug(cache->jit_debug.get());
+    unwinder.SetDexFiles(cache->dex_files.get());
 
     unwinder.Unwind();
     std::string frame_info = DumpFrames(unwinder);
