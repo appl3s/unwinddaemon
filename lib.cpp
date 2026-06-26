@@ -50,6 +50,8 @@
 #include <unwindstack/Maps.h>
 #include <unwindstack/Arch.h>
 #include <unwindstack/AndroidUnwinder.h>
+#include <unwindstack/JitDebug.h>
+#include <unwindstack/DexFiles.h>
 
 // Use the demangler from libc++.
 extern "C" char* __cxa_demangle(const char*, char*, size_t*, int* status);
@@ -517,6 +519,113 @@ const char* UnwindCallChainV2(int pid, UnwindOption* opt, uint64_t* regs_buf, vo
     strcpy(result_on_heap, frame_info.c_str());
     return result_on_heap;
 }
+/*
+ * CombinedMemory: reads stack from offline buffer (BPF snapshot), everything else
+ * from live /proc/pid/mem. This gives accurate stack data (captured at breakpoint time)
+ * while still allowing ELF/.eh_frame/JIT descriptor reads from the live process.
+ */
+class CombinedMemory : public unwindstack::Memory {
+ public:
+  CombinedMemory(std::shared_ptr<unwindstack::Memory> stack_offline,
+                 std::shared_ptr<unwindstack::Memory> process_live,
+                 uint64_t stack_start, uint64_t stack_end)
+      : stack_offline_(std::move(stack_offline)),
+        process_live_(std::move(process_live)),
+        stack_start_(stack_start),
+        stack_end_(stack_end) {}
+
+  size_t Read(uint64_t addr, void* dst, size_t size) override {
+    if (addr >= stack_start_ && addr < stack_end_) {
+      return stack_offline_->Read(addr, dst, size);
+    }
+    return process_live_->Read(addr, dst, size);
+  }
+
+ private:
+  std::shared_ptr<unwindstack::Memory> stack_offline_;
+  std::shared_ptr<unwindstack::Memory> process_live_;
+  uint64_t stack_start_;
+  uint64_t stack_end_;
+};
+
+/*
+ * V3: Hybrid unwind — offline stack (from BPF capture) + live process memory (for
+ * code/ELF/JIT). Fixes both the timing race (V2 reads stale stack) and the coverage
+ * gap (V1 can't read outside the buffer). Also fixes PAC mask.
+ */
+const char* UnwindCallChainV3(int pid, UnwindOption* opt, uint64_t* regs_buf, void* stack_buf) {
+    RegSet regs(opt->abi, opt->reg_mask, regs_buf);
+
+    uint64_t sp_reg_value;
+    if (!regs.GetSpRegValue(&sp_reg_value)) {
+        std::cerr << "V3: can't get sp reg value" << std::endl;
+        char* empty_result = (char*)malloc(1);
+        if (empty_result) empty_result[0] = '\0';
+        return empty_result;
+    }
+
+    uint64_t stack_addr = sp_reg_value;
+    size_t stack_size = opt->stack_size;
+
+    std::unique_ptr<unwindstack::Regs> unwind_regs(GetBacktraceRegs(regs));
+    if (!unwind_regs) {
+        char* empty_result = (char*)malloc(1);
+        if (empty_result) empty_result[0] = '\0';
+        return empty_result;
+    }
+
+    // Fix PAC mask: strip top byte from return addresses during unwind
+    if (unwind_regs->Arch() == unwindstack::ARCH_ARM64) {
+        static_cast<unwindstack::RegsArm64*>(unwind_regs.get())
+            ->SetPACMask(0xFF00000000000000ULL);
+    }
+
+    // Live process memory for code/ELF/.eh_frame/JIT descriptor reads
+    auto process_memory = unwindstack::Memory::CreateProcessMemoryCached(pid);
+
+    // Build combined memory: offline stack + live process
+    std::shared_ptr<unwindstack::Memory> combined_memory;
+    if (stack_buf != nullptr && stack_size > 0) {
+        auto stack_memory = unwindstack::Memory::CreateOfflineMemory(
+            reinterpret_cast<const uint8_t*>(stack_buf),
+            stack_addr, stack_addr + stack_size);
+        combined_memory = std::make_shared<CombinedMemory>(
+            stack_memory, process_memory, stack_addr, stack_addr + stack_size);
+    } else {
+        // No buffer: fall back to full live read (V2 behavior)
+        combined_memory = process_memory;
+    }
+
+    // RemoteMaps: live /proc/pid/maps (correct, code mappings don't change during call)
+    std::unique_ptr<unwindstack::RemoteMaps> maps(new unwindstack::RemoteMaps(pid));
+    if (!maps->Parse()) {
+        std::cerr << "V3: maps parse failed for pid " << pid << std::endl;
+        char* empty_result = (char*)malloc(1);
+        if (empty_result) empty_result[0] = '\0';
+        return empty_result;
+    }
+
+    // Create unwinder with combined memory
+    UnwinderWithPC unwinder(512, maps.get(), unwind_regs.get(), combined_memory, opt->show_pc);
+
+    // Set up JitDebug + DexFiles with live process memory (reads __jit_debug_descriptor)
+    std::vector<std::string> search_libs;
+    auto jit_debug = unwindstack::CreateJitDebug(unwind_regs->Arch(), process_memory, search_libs);
+    auto dex_files = unwindstack::CreateDexFiles(unwind_regs->Arch(), process_memory, search_libs);
+    unwinder.SetJitDebug(jit_debug.get());
+    unwinder.SetDexFiles(dex_files.get());
+
+    unwinder.Unwind();
+    std::string frame_info = DumpFrames(unwinder);
+
+    char* result_on_heap = (char*)malloc(frame_info.length() + 1);
+    if (result_on_heap == nullptr) {
+        return nullptr;
+    }
+    strcpy(result_on_heap, frame_info.c_str());
+    return result_on_heap;
+}
+
 }
 
 __attribute__ ((visibility("default")))
@@ -527,4 +636,9 @@ extern "C" const char* StackPlz(char* map_buffer, void* opt, void* regs_buf, voi
 __attribute__ ((visibility("default")))
 extern "C" const char* StackPlzV2(int pid, void* opt, void* regs_buf, void* stack_buf) {
   return unwinddaemon::UnwindCallChainV2(pid, (unwinddaemon::UnwindOption*) opt, (uint64_t*) regs_buf, stack_buf);
+}
+
+__attribute__ ((visibility("default")))
+extern "C" const char* StackPlzV3(int pid, void* opt, void* regs_buf, void* stack_buf) {
+  return unwinddaemon::UnwindCallChainV3(pid, (unwinddaemon::UnwindOption*) opt, (uint64_t*) regs_buf, stack_buf);
 }
