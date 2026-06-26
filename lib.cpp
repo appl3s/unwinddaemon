@@ -551,6 +551,7 @@ class CombinedMemory : public unwindstack::Memory {
 };
 
 struct PidCache {
+    std::mutex mu;
     std::shared_ptr<unwindstack::Memory> process_memory;
     std::unique_ptr<unwindstack::RemoteMaps> maps;
     std::unique_ptr<unwindstack::JitDebug> jit_debug;
@@ -567,13 +568,7 @@ static PidCache* GetOrCreateCache(pid_t pid, unwindstack::ArchEnum arch) {
     std::lock_guard<std::mutex> lock(g_cache_mutex);
     auto it = g_pid_cache.find(pid);
     if (it != g_pid_cache.end()) {
-        PidCache* c = it->second.get();
-        c->call_count++;
-        if (c->call_count % kMapsRefreshInterval == 0) {
-            c->maps.reset(new unwindstack::RemoteMaps(pid));
-            c->maps->Parse();
-        }
-        return c;
+        return it->second.get();
     }
     auto cache = std::make_unique<PidCache>();
     cache->process_memory = unwindstack::Memory::CreateProcessMemoryCached(pid);
@@ -582,7 +577,7 @@ static PidCache* GetOrCreateCache(pid_t pid, unwindstack::ArchEnum arch) {
     std::vector<std::string> search_libs;
     cache->jit_debug = unwindstack::CreateJitDebug(arch, cache->process_memory, search_libs);
     cache->dex_files = unwindstack::CreateDexFiles(arch, cache->process_memory, search_libs);
-    cache->call_count = 1;
+    cache->call_count = 0;
     PidCache* ptr = cache.get();
     g_pid_cache[pid] = std::move(cache);
     return ptr;
@@ -615,6 +610,13 @@ const char* UnwindCallChainV3(int pid, UnwindOption* opt, uint64_t* regs_buf, vo
     }
 
     PidCache* cache = GetOrCreateCache(pid, unwind_regs->Arch());
+    std::lock_guard<std::mutex> pid_lock(cache->mu);
+
+    cache->call_count++;
+    if (cache->call_count % kMapsRefreshInterval == 0) {
+        cache->maps.reset(new unwindstack::RemoteMaps(pid));
+        cache->maps->Parse();
+    }
 
     std::shared_ptr<unwindstack::Memory> combined_memory;
     if (stack_buf != nullptr && stack_size > 0) {
